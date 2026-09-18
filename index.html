@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AR Free Throw Trainer - Sensitive Trajectory</title>
+  <title>AR Free Throw Trainer - Goal & Trajectory Compare</title>
   <style>
     body { margin: 0; overflow: hidden; background: #000; color: #fff; font-family: sans-serif; }
     #container { position: relative; width: 100vw; height: 100vh; }
@@ -17,7 +17,7 @@
       padding: 12px 20px; 
       border-radius: 10px; 
       text-align: center;
-      min-width: 280px;
+      min-width: 300px;
       z-index: 999;
     }
     #status { font-size: 13px; font-weight: bold; color: #00ff66; }
@@ -33,8 +33,8 @@
     <video id="webcam" autoplay playsinline muted></video>
     <canvas id="canvas"></canvas>
     <div id="ui">
-      <div id="status">AIモデルを初期化中...</div>
-      <div id="ball-info">しばらくお待ちください</div>
+      <div id="status">画面上の「ゴール（リング）」をタップして設置してください</div>
+      <div id="ball-info">ボール認識準備中...</div>
     </div>
   </div>
 
@@ -47,20 +47,21 @@
 
     let model = null;
     let smoothX = null, smoothY = null, smoothR = null;
-    const SMOOTHING = 0.5; // スムージングを少し弱めて応答性を向上
+    const SMOOTHING = 0.5;
+
+    // ゴールリングのAR位置 (X, Y)
+    let rimX = null;
+    let rimY = null;
 
     const posHistory = [];
-    const MAX_HISTORY = 4; // 直近4フレームで鋭く速度を感知
-
+    const MAX_HISTORY = 4;
     let velocityX = 0;
     let velocityY = 0;
 
     async function initAI() {
       try {
-        statusEl.innerText = "AIエンジン読み込み中...";
         await tf.ready();
         model = await cocoSsd.load();
-        statusEl.innerText = "AI準備完了！カメラを起動します";
         startCamera();
       } catch (err) {
         statusEl.innerText = "AIロード失敗: " + err.message;
@@ -86,10 +87,19 @@
       if (stream) {
         video.srcObject = stream;
         await video.play();
-        statusEl.innerText = "高感度トラッキング起動中";
         detectFrame();
       }
     }
+
+    // 画面タップでゴールの位置（リング）を固定設置
+    canvas.addEventListener('pointerdown', (e) => {
+      const rect = canvas.getBoundingClientRect();
+      rimX = e.clientX - rect.left;
+      rimY = e.clientY - rect.top;
+
+      statusEl.innerText = "ARゴールを設置しました！緑（実軌道）と水色（最適軌道）を合わせてください";
+      statusEl.style.color = "#00ffff";
+    });
 
     async function detectFrame() {
       canvas.width = video.videoWidth || window.innerWidth;
@@ -120,7 +130,7 @@
 
             calculateVelocity();
 
-            ballInfoEl.innerText = `検出中 (Vx: ${Math.round(velocityX)}, Vy: ${Math.round(velocityY)})`;
+            ballInfoEl.innerText = `ボール検出中 | ゴール再設定は画面を再タップ`;
           } else {
             smoothX = null;
             posHistory.length = 0;
@@ -128,9 +138,7 @@
             velocityY = 0;
             ballInfoEl.innerText = "バスケットボールを画面内に映してください";
           }
-        } catch (e) {
-          console.error(e);
-        }
+        } catch (e) {}
       }
 
       drawAR();
@@ -144,7 +152,6 @@
       const dt = (newest.time - oldest.time) / 1000;
 
       if (dt > 0) {
-        // 動きの感度倍率（2.2倍）をかけて鋭く反応させる
         velocityX = ((newest.x - oldest.x) / dt) * 2.2;
         velocityY = ((newest.y - oldest.y) / dt) * 2.2;
       }
@@ -153,33 +160,73 @@
     function drawAR() {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
 
+      // 1. ARゴールリングの描画
+      if (rimX !== null && rimY !== null) {
+        // バックボード
+        ctx.fillStyle = "rgba(255, 255, 255, 0.3)";
+        ctx.strokeStyle = "#ffffff";
+        ctx.lineWidth = 3;
+        ctx.fillRect(rimX - 40, rimY - 50, 80, 50);
+        ctx.strokeRect(rimX - 40, rimY - 50, 80, 50);
+
+        // リング（赤オレンジ）
+        ctx.beginPath();
+        ctx.ellipse(rimX, rimY, 35, 12, 0, 0, Math.PI * 2);
+        ctx.strokeStyle = '#FF5722';
+        ctx.lineWidth = 6;
+        ctx.stroke();
+      }
+
+      // 2. ボールと軌道の描画
       if (smoothX !== null) {
-        // ボール枠
+        // ボール検出枠
         ctx.beginPath();
         ctx.arc(smoothX, smoothY, smoothR, 0, Math.PI * 2);
-        ctx.strokeStyle = '#00FFFF';
+        ctx.strokeStyle = '#FFFF00';
         ctx.lineWidth = 4;
         ctx.stroke();
 
-        // 軌道描画
-        drawDynamicTrajectory(smoothX, smoothY, velocityX, velocityY);
+        // 【最適軌道（水跡）】ボールからリングへの理想的な放物線
+        if (rimX !== null && rimY !== null) {
+          drawOptimalTrajectory(smoothX, smoothY, rimX, rimY);
+        }
+
+        // 【実際の予測軌道（緑色）】現在のボールの動きに基づく軌道
+        drawActualTrajectory(smoothX, smoothY, velocityX, velocityY);
       }
     }
 
-    function drawDynamicTrajectory(startX, startY, vx, vy) {
+    // 理想的な成功軌道（2次ベジェ曲線による水色の弧）
+    function drawOptimalTrajectory(sx, sy, tx, ty) {
       ctx.beginPath();
-      ctx.strokeStyle = '#00FF66';
-      ctx.lineWidth = 5; // 視認性を高めるため線を太く
+      ctx.strokeStyle = '#00FFFF'; // 水色
+      ctx.lineWidth = 4;
+      ctx.setLineDash([4, 4]);
+
+      // ボールとゴールの高低差に応じた最高の頂点を計算（きれいな高弧を描く）
+      const midX = (sx + tx) / 2;
+      const peakY = Math.min(sy, ty) - Math.abs(sx - tx) * 0.4; 
+
+      ctx.moveTo(sx, sy);
+      ctx.quadraticCurveTo(midX, peakY, tx, ty);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    // 実際のボール速度から計算される動的放物線（緑色）
+    function drawActualTrajectory(startX, startY, vx, vy) {
+      ctx.beginPath();
+      ctx.strokeStyle = '#00FF66'; // 緑色
+      ctx.lineWidth = 5;
       ctx.setLineDash([8, 6]);
 
       let currX = startX;
       let currY = startY;
 
-      // 停止時のデフォルト仰角（ふんわり上向き）
-      let simVx = (Math.abs(vx) < 50) ? 300 : vx;
+      let simVx = (Math.abs(vx) < 50) ? (rimX ? (rimX - startX) * 0.8 : 250) : vx;
       let simVy = (Math.abs(vy) < 50) ? -550 : vy;
 
-      const gravity = 1100; // 重力感度
+      const gravity = 1100;
       const step = 0.03;
       const totalSteps = 30;
 
@@ -191,7 +238,6 @@
         currY += simVy * step;
 
         ctx.lineTo(currX, currY);
-
         if (currX < 0 || currX > canvas.width || currY > canvas.height) break;
       }
 
