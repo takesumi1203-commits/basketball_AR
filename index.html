@@ -3,13 +3,26 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AR Free Throw Trainer</title>
+  <title>AR Free Throw Trainer - MediaPipe Tracking</title>
+  <!-- MediaPipe Tasks Vision CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/vision_bundle.js" crossorigin="anonymous"></script>
   <style>
     body { margin: 0; overflow: hidden; background: #000; color: #fff; font-family: sans-serif; }
     #container { position: relative; width: 100vw; height: 100vh; }
     video, canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: cover; }
-    #ui { position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.8); padding: 15px; border-radius: 10px; text-align: center; }
-    button { padding: 10px 20px; background: #007bff; color: white; border: none; border-radius: 5px; font-size: 16px; margin-top: 10px; }
+    #ui { 
+      position: absolute; 
+      bottom: 20px; 
+      left: 50%; 
+      transform: translateX(-50%); 
+      background: rgba(0,0,0,0.8); 
+      padding: 12px 20px; 
+      border-radius: 10px; 
+      text-align: center;
+      min-width: 240px;
+    }
+    #status { font-size: 14px; font-weight: bold; color: #00ff66; }
+    #ball-info { font-size: 12px; color: #ccc; margin-top: 5px; }
   </style>
 </head>
 <body>
@@ -18,20 +31,48 @@
     <video id="webcam" autoplay playsinline muted></video>
     <canvas id="canvas"></canvas>
     <div id="ui">
-      <div id="status">カメラ読み込み中...</div>
-      <button onclick="sendData()">データを記録テスト</button>
+      <div id="status">AIモデル読み込み中...</div>
+      <div id="ball-info">ボール未検出</div>
     </div>
   </div>
 
   <script>
-    // ★ここにStep 1で取得したGASのWebアプリURLを貼り付け
-    const GAS_API_URL = "https://script.google.com/macros/s/YOUR_GAS_DEPLOYMENT_ID/exec";
-
+    const { ObjectDetector, FilesetResolver } = tasksVision;
+    
     const video = document.getElementById('webcam');
     const canvas = document.getElementById('canvas');
     const ctx = canvas.getContext('2d');
+    const statusEl = document.getElementById('status');
+    const ballInfoEl = document.getElementById('ball-info');
 
-    // カメラ起動処理（iPhoneのSafariでも1発で動きます）
+    let objectDetector;
+    let lastVideoTime = -1;
+    let ballPosition = null; // 検出されたボールの座標 {x, y, radius}
+
+    // 1. MediaPipe Object Detector の初期化
+    async function initMediaPipe() {
+      try {
+        const vision = await FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+        );
+        
+        objectDetector = await ObjectDetector.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath: `https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite`,
+            delegate: "GPU"
+          },
+          scoreThreshold: 0.35, // 検出閾値
+          runningMode: "VIDEO"
+        });
+
+        statusEl.innerText = "カメラ起動中...";
+        initCamera();
+      } catch (err) {
+        statusEl.innerText = "AI読み込みエラー: " + err.message;
+      }
+    }
+
+    // 2. カメラの初期化
     async function initCamera() {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
@@ -39,48 +80,84 @@
           audio: false
         });
         video.srcObject = stream;
-        document.getElementById('status').innerText = "ARガイド表示中";
-        requestAnimationFrame(draw);
+        statusEl.innerText = "リアルタイム追跡中";
+        requestAnimationFrame(renderLoop);
       } catch (err) {
-        document.getElementById('status').innerText = "カメラエラー: " + err.message;
+        statusEl.innerText = "カメラエラー: " + err.message;
       }
     }
 
-    // ARガイドライン描画
-    function draw() {
+    // 3. メインレンダリング・推論ループ
+    async function renderLoop() {
       canvas.width = video.videoWidth || window.innerWidth;
       canvas.height = video.videoHeight || window.innerHeight;
       ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-      // 手本の放物線
+      // フレームが更新されたらAI推論を実行
+      if (objectDetector && video.currentTime !== lastVideoTime && video.readyState >= 2) {
+        lastVideoTime = video.currentTime;
+        const startTimeMs = performance.now();
+        const detections = await objectDetector.detectForVideo(video, startTimeMs);
+
+        // 「sports ball」カテゴリのオブジェクトを特定
+        const sportsBall = detections.detections.find(d => 
+          d.categories.some(c => c.categoryName === "sports ball")
+        );
+
+        if (sportsBall) {
+          const bb = sportsBall.boundingBox;
+          // スケール変換（Video解像度 → Canvas描画サイズ）
+          const scaleX = canvas.width / video.videoWidth;
+          const scaleY = canvas.height / video.videoHeight;
+
+          ballPosition = {
+            x: (bb.originX + bb.width / 2) * scaleX,
+            y: (bb.originY + bb.height / 2) * scaleY,
+            radius: (Math.max(bb.width, bb.height) / 2) * scaleX
+          };
+          ballInfoEl.innerText = `ボール位置: X:${Math.round(ballPosition.x)} Y:${Math.round(ballPosition.y)}`;
+        } else {
+          ballPosition = null;
+          ballInfoEl.innerText = "ボール未検出";
+        }
+      }
+
+      // 4. AR要素の描画
+      drawAR();
+
+      requestAnimationFrame(renderLoop);
+    }
+
+    // 4. キャンバス描画処理
+    function drawAR() {
+      // (A) ガイド放物線（テスト描画）
       ctx.beginPath();
-      ctx.strokeStyle = '#00FF66';
+      ctx.strokeStyle = 'rgba(0, 255, 102, 0.6)';
       ctx.lineWidth = 4;
       ctx.setLineDash([8, 8]);
-      ctx.moveTo(canvas.width * 0.2, canvas.height * 0.8);
+      ctx.moveTo(canvas.width * 0.15, canvas.height * 0.8);
       ctx.quadraticCurveTo(canvas.width * 0.5, canvas.height * 0.2, canvas.width * 0.85, canvas.height * 0.45);
       ctx.stroke();
 
-      requestAnimationFrame(draw);
-    }
+      // (B) 検出されたボールのリアルタイム追跡枠（オレンジ色の円）
+      if (ballPosition) {
+        ctx.setLineDash([]);
+        ctx.beginPath();
+        ctx.arc(ballPosition.x, ballPosition.y, ballPosition.radius, 0, Math.PI * 2);
+        ctx.strokeStyle = '#FF6600';
+        ctx.lineWidth = 4;
+        ctx.stroke();
 
-    // GAS APIへデータ送信
-    async function sendData() {
-      document.getElementById('status').innerText = "送信中...";
-      try {
-        await fetch(GAS_API_URL, {
-          method: 'POST',
-          mode: 'no-cors', // GASへのCORSエラー回避
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ angleError: 1.8, score: 92 })
-        });
-        document.getElementById('status').innerText = "記録完了！";
-      } catch (err) {
-        document.getElementById('status').innerText = "送信失敗: " + err.message;
+        // 中心点
+        ctx.beginPath();
+        ctx.arc(ballPosition.x, ballPosition.y, 4, 0, Math.PI * 2);
+        ctx.fillStyle = '#FF6600';
+        ctx.fill();
       }
     }
 
-    initCamera();
+    // アプリ起動
+    initMediaPipe();
   </script>
 </body>
 </html>
