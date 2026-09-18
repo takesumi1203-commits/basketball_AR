@@ -3,7 +3,9 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AR Free Throw Trainer - Debug</title>
+  <title>AR Free Throw Trainer - MediaPipe</title>
+  <!-- MediaPipe Tasks Vision CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/vision_bundle.js" crossorigin="anonymous"></script>
   <style>
     body { margin: 0; overflow: hidden; background: #000; color: #fff; font-family: sans-serif; }
     #container { position: relative; width: 100vw; height: 100vh; }
@@ -21,6 +23,7 @@
       z-index: 999;
     }
     #status { font-size: 13px; font-weight: bold; color: #00ff66; word-break: break-all; }
+    #ball-info { font-size: 11px; color: #aaa; margin-top: 4px; }
   </style>
 </head>
 <body>
@@ -29,34 +32,31 @@
     <video id="webcam" autoplay playsinline muted></video>
     <canvas id="canvas"></canvas>
     <div id="ui">
-      <div id="status">初期化スタート...</div>
+      <div id="status">カメラ起動中...</div>
+      <div id="ball-info">AI初期化中</div>
     </div>
   </div>
 
   <script>
     const statusEl = document.getElementById('status');
+    const ballInfoEl = document.getElementById('ball-info');
     const video = document.getElementById('webcam');
     const canvas = document.getElementById('canvas');
     const ctx = canvas.getContext('2d');
 
-    // 画面上にJavaScriptエラーを直接書き出す処理
+    let objectDetector = null;
+    let lastVideoTime = -1;
+    let ballPosition = null;
+
+    // JavaScriptエラーハンドラー
     window.onerror = function(msg, url, lineNo) {
       statusEl.style.color = "#ff4d4d";
-      statusEl.innerText = "JSエラー: " + msg + " (行:" + lineNo + ")";
+      statusEl.innerText = "エラー: " + msg + " (行:" + lineNo + ")";
       return false;
     };
 
-    // 段階的にカメラ取得を試みる安全な関数
+    // 1. 動作実績のあるカメラ起動処理
     async function startCamera() {
-      statusEl.innerText = "Step 1: カメラアクセス要求中...";
-
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        statusEl.style.color = "#ff4d4d";
-        statusEl.innerText = "エラー: お使いのブラウザはカメラ機能に対応していません";
-        return;
-      }
-
-      // 取得条件の候補（条件が緩い順に試す）
       const constraintsList = [
         { video: { facingMode: "environment" }, audio: false },
         { video: { facingMode: "user" }, audio: false },
@@ -64,49 +64,100 @@
       ];
 
       let stream = null;
-      let lastErr = null;
-
       for (let constraints of constraintsList) {
         try {
           stream = await navigator.mediaDevices.getUserMedia(constraints);
           if (stream) break;
-        } catch (e) {
-          lastErr = e;
-        }
+        } catch (e) {}
       }
 
       if (stream) {
-        statusEl.innerText = "Step 2: 映像ストリーム設定中...";
         video.srcObject = stream;
-        
-        try {
-          await video.play();
-          statusEl.style.color = "#00ff66";
-          statusEl.innerText = "カメラ起動完了！画面描画中...";
-          requestAnimationFrame(drawLoop);
-        } catch (playErr) {
-          statusEl.style.color = "#ffcc00";
-          statusEl.innerText = "再生エラー: " + playErr.message + " (タップして再生)";
-          // 画面タップで強制再生するイベントリスナー
-          document.body.addEventListener('click', () => {
-            video.play();
-            statusEl.innerText = "カメラ起動完了！";
-            requestAnimationFrame(drawLoop);
-          }, { once: true });
-        }
+        await video.play();
+        statusEl.style.color = "#00ff66";
+        statusEl.innerText = "カメラ起動完了！AI読み込み中...";
+        requestAnimationFrame(drawLoop);
+        // カメラ起動後に非同期でMediaPipeを読み込む
+        initMediaPipe();
       } else {
         statusEl.style.color = "#ff4d4d";
-        statusEl.innerText = "カメラ取得失敗: " + (lastErr ? lastErr.message : "不明なエラー");
+        statusEl.innerText = "カメラアクセス失敗";
       }
     }
 
-    // 簡易AR描画ループ
-    function drawLoop() {
+    // 2. MediaPipe Object Detector の非同期ロード
+    async function initMediaPipe() {
+      try {
+        if (!window.tasksVision) {
+          ballInfoEl.innerText = "MediaPipeライブラリの読込失敗";
+          return;
+        }
+
+        const { ObjectDetector, FilesetResolver } = window.tasksVision;
+        const vision = await FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+        );
+        
+        objectDetector = await ObjectDetector.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath: "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite",
+            delegate: "GPU"
+          },
+          scoreThreshold: 0.3,
+          runningMode: "VIDEO"
+        });
+
+        statusEl.innerText = "AR・AIリアルタイム追跡中";
+        ballInfoEl.innerText = "ボール未検出";
+      } catch (err) {
+        ballInfoEl.innerText = "AI読み込みエラー: " + err.message;
+      }
+    }
+
+    // 3. レンダリング＆推論ループ
+    async function drawLoop() {
       canvas.width = video.videoWidth || window.innerWidth;
       canvas.height = video.videoHeight || window.innerHeight;
       ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-      // ガイド用点線
+      // AIモデルが準備完了していればボール検出処理を実行
+      if (objectDetector && video.currentTime !== lastVideoTime && video.readyState >= 2) {
+        lastVideoTime = video.currentTime;
+        try {
+          const detections = await objectDetector.detectForVideo(video, performance.now());
+          const sportsBall = detections.detections.find(d => 
+            d.categories.some(c => c.categoryName === "sports ball")
+          );
+
+          if (sportsBall) {
+            const bb = sportsBall.boundingBox;
+            const scaleX = canvas.width / video.videoWidth;
+            const scaleY = canvas.height / video.videoHeight;
+
+            ballPosition = {
+              x: (bb.originX + bb.width / 2) * scaleX,
+              y: (bb.originY + bb.height / 2) * scaleY,
+              radius: (Math.max(bb.width, bb.height) / 2) * scaleX
+            };
+            ballInfoEl.innerText = `ボール検出！ (X:${Math.round(ballPosition.x)}, Y:${Math.round(ballPosition.y)})`;
+          } else {
+            ballPosition = null;
+            ballInfoEl.innerText = "ボール未検出";
+          }
+        } catch (e) {
+          console.warn("推論エラー:", e);
+        }
+      }
+
+      // 4. AR要素の描画
+      drawAR();
+
+      requestAnimationFrame(drawLoop);
+    }
+
+    // 5. キャンバス描画処理
+    function drawAR() {
+      // (A) 手本軌道ガイドライン（緑の点線）
       ctx.beginPath();
       ctx.strokeStyle = '#00FF66';
       ctx.lineWidth = 4;
@@ -115,10 +166,23 @@
       ctx.quadraticCurveTo(canvas.width * 0.5, canvas.height * 0.2, canvas.width * 0.85, canvas.height * 0.45);
       ctx.stroke();
 
-      requestAnimationFrame(drawLoop);
+      // (B) 検出されたボールのリアルタイム追跡枠（オレンジの円）
+      if (ballPosition) {
+        ctx.setLineDash([]);
+        ctx.beginPath();
+        ctx.arc(ballPosition.x, ballPosition.y, ballPosition.radius, 0, Math.PI * 2);
+        ctx.strokeStyle = '#FF6600';
+        ctx.lineWidth = 4;
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.arc(ballPosition.x, ballPosition.y, 4, 0, Math.PI * 2);
+        ctx.fillStyle = '#FF6600';
+        ctx.fill();
+      }
     }
 
-    // 起動
+    // アプリ起動
     startCamera();
   </script>
 </body>
