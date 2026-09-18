@@ -4,8 +4,8 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>AR Free Throw Trainer - MediaPipe</title>
-  <!-- MediaPipe Tasks Vision CDN -->
-  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/vision_bundle.js" crossorigin="anonymous"></script>
+  <!-- より安定した unpkg CDN に変更 -->
+  <script src="https://unpkg.com/@mediapipe/tasks-vision@0.10.14/vision_bundle.js" crossorigin="anonymous"></script>
   <style>
     body { margin: 0; overflow: hidden; background: #000; color: #fff; font-family: sans-serif; }
     #container { position: relative; width: 100vw; height: 100vh; }
@@ -33,7 +33,7 @@
     <canvas id="canvas"></canvas>
     <div id="ui">
       <div id="status">カメラ起動中...</div>
-      <div id="ball-info">AI初期化中</div>
+      <div id="ball-info">AI初期化準備中</div>
     </div>
   </div>
 
@@ -48,14 +48,13 @@
     let lastVideoTime = -1;
     let ballPosition = null;
 
-    // JavaScriptエラーハンドラー
     window.onerror = function(msg, url, lineNo) {
       statusEl.style.color = "#ff4d4d";
       statusEl.innerText = "エラー: " + msg + " (行:" + lineNo + ")";
       return false;
     };
 
-    // 1. 動作実績のあるカメラ起動処理
+    // 1. カメラ起動
     async function startCamera() {
       const constraintsList = [
         { video: { facingMode: "environment" }, audio: false },
@@ -75,27 +74,40 @@
         video.srcObject = stream;
         await video.play();
         statusEl.style.color = "#00ff66";
-        statusEl.innerText = "カメラ起動完了！AI読み込み中...";
+        statusEl.innerText = "カメラ起動完了！AIモデル読込中...";
         requestAnimationFrame(drawLoop);
-        // カメラ起動後に非同期でMediaPipeを読み込む
-        initMediaPipe();
+        
+        // ライブラリの読み込み完了を待ってから初期化
+        checkAndInitMediaPipe();
       } else {
         statusEl.style.color = "#ff4d4d";
         statusEl.innerText = "カメラアクセス失敗";
       }
     }
 
-    // 2. MediaPipe Object Detector の非同期ロード
+    // 2. MediaPipeライブラリの存在を確認して安全に初期化
+    function checkAndInitMediaPipe() {
+      let attempts = 0;
+      const interval = setInterval(() => {
+        attempts++;
+        if (window.tasksVision) {
+          clearInterval(interval);
+          initMediaPipe();
+        } else if (attempts > 30) { // 15秒待っても読込めない場合
+          clearInterval(interval);
+          ballInfoEl.innerText = "CDN読込タイムアウト。通信環境を確認してください。";
+        } else {
+          ballInfoEl.innerText = `ライブラリ待機中... (${attempts})`;
+        }
+      }, 500);
+    }
+
+    // 3. MediaPipe Object Detector の初期化
     async function initMediaPipe() {
       try {
-        if (!window.tasksVision) {
-          ballInfoEl.innerText = "MediaPipeライブラリの読込失敗";
-          return;
-        }
-
         const { ObjectDetector, FilesetResolver } = window.tasksVision;
         const vision = await FilesetResolver.forVisionTasks(
-          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+          "https://unpkg.com/@mediapipe/tasks-vision@0.10.14/wasm"
         );
         
         objectDetector = await ObjectDetector.createFromOptions(vision, {
@@ -110,17 +122,16 @@
         statusEl.innerText = "AR・AIリアルタイム追跡中";
         ballInfoEl.innerText = "ボール未検出";
       } catch (err) {
-        ballInfoEl.innerText = "AI読み込みエラー: " + err.message;
+        ballInfoEl.innerText = "AI読込エラー: " + err.message;
       }
     }
 
-    // 3. レンダリング＆推論ループ
+    // 4. メイン描画・推論ループ
     async function drawLoop() {
       canvas.width = video.videoWidth || window.innerWidth;
       canvas.height = video.videoHeight || window.innerHeight;
       ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-      // AIモデルが準備完了していればボール検出処理を実行
       if (objectDetector && video.currentTime !== lastVideoTime && video.readyState >= 2) {
         lastVideoTime = video.currentTime;
         try {
@@ -149,15 +160,13 @@
         }
       }
 
-      // 4. AR要素の描画
       drawAR();
-
       requestAnimationFrame(drawLoop);
     }
 
-    // 5. キャンバス描画処理
+    // 5. キャンバス描画
     function drawAR() {
-      // (A) 手本軌道ガイドライン（緑の点線）
+      // (A) 手本軌道ガイドライン（緑）
       ctx.beginPath();
       ctx.strokeStyle = '#00FF66';
       ctx.lineWidth = 4;
@@ -166,7 +175,7 @@
       ctx.quadraticCurveTo(canvas.width * 0.5, canvas.height * 0.2, canvas.width * 0.85, canvas.height * 0.45);
       ctx.stroke();
 
-      // (B) 検出されたボールのリアルタイム追跡枠（オレンジの円）
+      // (B) ボール追跡枠（オレンジ）
       if (ballPosition) {
         ctx.setLineDash([]);
         ctx.beginPath();
@@ -182,7 +191,6 @@
       }
     }
 
-    // アプリ起動
     startCamera();
   </script>
 </body>
