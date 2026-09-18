@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AR Free Throw Trainer - Tap Lock Edition</title>
+  <title>AR Free Throw Trainer - Precision Lock</title>
   <style>
     body { margin: 0; overflow: hidden; background: #000; color: #fff; font-family: sans-serif; }
     #container { position: relative; width: 100vw; height: 100vh; }
@@ -31,7 +31,7 @@
     <canvas id="canvas"></canvas>
     <div id="ui">
       <div id="status">カメラ起動完了</div>
-      <div id="ball-info">【操作】画面上のボールをタップしてロックオン！</div>
+      <div id="ball-info">【操作】ボールの中央をタップしてロック！</div>
     </div>
   </div>
 
@@ -45,13 +45,13 @@
     const sampleCanvas = document.createElement('canvas');
     const sampleCtx = sampleCanvas.getContext('2d', { willReadFrequently: true });
 
-    // ロックオン用の色ターゲット（RGB）
     let targetRGB = null;
+    let tolerance = 25; // 許容誤差を大幅に厳密化
 
     let smoothX = null;
     let smoothY = null;
     let smoothR = null;
-    const SMOOTHING_FACTOR = 0.3;
+    const SMOOTHING_FACTOR = 0.35;
 
     async function startCamera() {
       const constraintsList = [
@@ -75,14 +75,14 @@
       }
     }
 
-    // タップ位置の色を取得してターゲットに設定
+    // タップ位置とその周辺の平均色を厳密にサンプル取得
     canvas.addEventListener('pointerdown', (e) => {
       const rect = canvas.getBoundingClientRect();
       const clickX = e.clientX - rect.left;
       const clickY = e.clientY - rect.top;
 
-      const w = sampleCanvas.width || 120;
-      const h = sampleCanvas.height || 90;
+      const w = sampleCanvas.width || 160;
+      const h = sampleCanvas.height || 120;
 
       const scaleX = w / canvas.width;
       const scaleY = h / canvas.height;
@@ -90,16 +90,38 @@
       const sampleX = Math.floor(clickX * scaleX);
       const sampleY = Math.floor(clickY * scaleY);
 
-      const pixelData = sampleCtx.getImageData(sampleX, sampleY, 1, 1).data;
-      targetRGB = { r: pixelData[0], g: pixelData[1], b: pixelData[2] };
+      // タップ周辺 5x5 ピクセルの平均色を取得
+      const size = 5;
+      const startX = Math.max(0, sampleX - 2);
+      const startY = Math.max(0, sampleY - 2);
+      const imgData = sampleCtx.getImageData(startX, startY, size, size).data;
 
-      statusEl.innerText = "ボールの色をロックオンしました！";
+      let sumR = 0, sumG = 0, sumB = 0, count = 0;
+      for (let i = 0; i < imgData.length; i += 4) {
+        sumR += imgData[i];
+        sumG += imgData[i + 1];
+        sumB += imgData[i + 2];
+        count++;
+      }
+
+      targetRGB = {
+        r: Math.round(sumR / count),
+        g: Math.round(sumG / count),
+        b: Math.round(sumB / count)
+      };
+
+      // 色に応じて許容範囲をタイトに自動調整
+      tolerance = 22;
+
+      statusEl.innerText = `ロックオン完了 (R:${targetRGB.r} G:${targetRGB.g} B:${targetRGB.b})`;
       statusEl.style.color = "#00ffff";
+      
+      smoothX = null; // リセット
     });
 
     function detectBallColor() {
-      const w = 120;
-      const h = Math.floor(video.videoHeight * (w / video.videoWidth)) || 90;
+      const w = 160;
+      const h = Math.floor(video.videoHeight * (w / video.videoWidth)) || 120;
       sampleCanvas.width = w;
       sampleCanvas.height = h;
 
@@ -107,24 +129,20 @@
       const imgData = sampleCtx.getImageData(0, 0, w, h);
       const data = imgData.data;
 
-      if (!targetRGB) return; // タップされるまで処理保留
+      if (!targetRGB) return;
 
       let sumX = 0, sumY = 0, count = 0;
       let minX = w, maxX = 0, minY = h, maxY = 0;
-
-      const TOLERANCE = 45; // 色の許容誤差
 
       for (let i = 0; i < data.length; i += 4) {
         const r = data[i];
         const g = data[i + 1];
         const b = data[i + 2];
 
-        // ロックオンした色とのユークリッド距離計算
-        const diffR = Math.abs(r - targetRGB.r);
-        const diffG = Math.abs(g - targetRGB.g);
-        const diffB = Math.abs(b - targetRGB.b);
+        // マンハッタン距離による高速・厳密判定
+        const diff = Math.abs(r - targetRGB.r) + Math.abs(g - targetRGB.g) + Math.abs(b - targetRGB.b);
 
-        if (diffR < TOLERANCE && diffG < TOLERANCE && diffB < TOLERANCE) {
+        if (diff < tolerance * 2.2) {
           const pixelIdx = i / 4;
           const x = pixelIdx % w;
           const y = Math.floor(pixelIdx / w);
@@ -140,7 +158,11 @@
         }
       }
 
-      if (count > 12) {
+      // 検出領域が広すぎる（ノイズ巻き込み）場合はカット
+      const boxW = maxX - minX;
+      const boxH = maxY - minY;
+
+      if (count > 10 && boxW < w * 0.45 && boxH < h * 0.45) {
         const avgX = sumX / count;
         const avgY = sumY / count;
 
@@ -149,7 +171,7 @@
 
         const rawX = avgX * scaleX;
         const rawY = avgY * scaleY;
-        const rawR = Math.max(((maxX - minX) * scaleX) / 2, 25);
+        const rawR = Math.max(Math.max(boxW, boxH) * scaleX / 2, 18);
 
         if (smoothX === null) {
           smoothX = rawX;
@@ -161,9 +183,11 @@
           smoothR += (rawR - smoothR) * SMOOTHING_FACTOR;
         }
 
-        ballInfoEl.innerText = `追跡中 (X:${Math.round(smoothX)}, Y:${Math.round(smoothY)})`;
+        ballInfoEl.innerText = `ボール追跡中 (半径: ${Math.round(smoothR)}px)`;
+      } else if (count >= w * h * 0.3) {
+        ballInfoEl.innerText = "範囲が広すぎます：ボールの中央のみを再度タップしてください";
       } else {
-        ballInfoEl.innerText = "ターゲット喪失：画面上のボールを再度タップしてください";
+        ballInfoEl.innerText = "追跡対象を探しています...";
       }
     }
 
@@ -196,11 +220,11 @@
         ctx.beginPath();
         ctx.arc(smoothX, smoothY, smoothR, 0, Math.PI * 2);
         ctx.strokeStyle = '#00FFFF';
-        ctx.lineWidth = 4;
+        ctx.lineWidth = 3;
         ctx.stroke();
 
         ctx.beginPath();
-        ctx.arc(smoothX, smoothY, 6, 0, Math.PI * 2);
+        ctx.arc(smoothX, smoothY, 5, 0, Math.PI * 2);
         ctx.fillStyle = '#00FFFF';
         ctx.fill();
       }
