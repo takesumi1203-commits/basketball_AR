@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AR Free Throw Trainer - AI Detection</title>
+  <title>AR Free Throw Trainer - Stable AI Edition</title>
   <style>
     body { margin: 0; overflow: hidden; background: #000; color: #fff; font-family: sans-serif; }
     #container { position: relative; width: 100vw; height: 100vh; }
@@ -23,10 +23,10 @@
     #status { font-size: 13px; font-weight: bold; color: #00ff66; }
     #ball-info { font-size: 11px; color: #aaa; margin-top: 4px; }
   </style>
-  <!-- Google公式の安定したCDNからMediaPipe Objectron/Visionをロード -->
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core@4.10.0"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl@4.10.0"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3"></script>
+
+  <!-- 順序・依存関係を完全に担保した単一構成バンドル -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.10.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
 </head>
 <body>
 
@@ -34,7 +34,7 @@
     <video id="webcam" autoplay playsinline muted></video>
     <canvas id="canvas"></canvas>
     <div id="ui">
-      <div id="status">AIモデルをロード中...</div>
+      <div id="status">AIモデルを初期化中...</div>
       <div id="ball-info">しばらくお待ちください</div>
     </div>
   </div>
@@ -47,17 +47,18 @@
     const ctx = canvas.getContext('2d');
 
     let model = null;
-    let ballPosition = null;
-
-    // 位置補正用（スムーズな追従）
     let smoothX = null, smoothY = null, smoothR = null;
-    const SMOOTHING = 0.4;
+    const SMOOTHING = 0.35;
 
     async function initAI() {
       try {
-        // 軽量なCOCO-SSDモデルをロード（スポーツボール認識対応）
-        model = await cocoSsd.load({ base: 'lite_mobilenet_v2' });
-        statusEl.innerText = "AIの準備完了！カメラを起動します";
+        statusEl.innerText = "AIエンジン読み込み中...";
+        // tfjsの準備完了を確実に待機
+        await tf.ready();
+        
+        // 軽量なCOCO-SSDモデルのロード
+        model = await cocoSsd.load();
+        statusEl.innerText = "AI準備完了！カメラを起動します";
         startCamera();
       } catch (err) {
         statusEl.innerText = "AIロード失敗: " + err.message;
@@ -66,24 +67,28 @@
     }
 
     async function startCamera() {
-      const constraints = { video: { facingMode: "environment" }, audio: false };
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      const constraintsList = [
+        { video: { facingMode: "environment" }, audio: false },
+        { video: { facingMode: "user" }, audio: false },
+        { video: true, audio: false }
+      ];
+
+      let stream = null;
+      for (let constraints of constraintsList) {
+        try {
+          stream = await navigator.mediaDevices.getUserMedia(constraints);
+          if (stream) break;
+        } catch (e) {}
+      }
+
+      if (stream) {
         video.srcObject = stream;
         await video.play();
-        statusEl.innerText = "リアルタイムAI追跡中";
+        statusEl.innerText = "リアルタイムAI追跡起動";
         detectFrame();
-      } catch (e) {
-        // インカメラ fallback
-        try {
-          const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-          video.srcObject = stream;
-          await video.play();
-          statusEl.innerText = "リアルタイムAI追跡中";
-          detectFrame();
-        } catch(err) {
-          statusEl.innerText = "カメラ起動失敗";
-        }
+      } else {
+        statusEl.innerText = "カメラの起動に失敗しました";
+        statusEl.style.color = "#ff4d4d";
       }
     }
 
@@ -91,29 +96,33 @@
       canvas.width = video.videoWidth || window.innerWidth;
       canvas.height = video.videoHeight || window.innerHeight;
 
-      if (model && video.readyState === 4) {
-        const predictions = await model.detect(video, 5, 0.3);
-        
-        // 「sports ball」または「ball」として判定されたオブジェクトを探す
-        const ball = predictions.find(p => p.class === 'sports ball' || p.class === 'ball');
+      if (model && video.readyState >= 2) {
+        try {
+          const predictions = await model.detect(video, 5, 0.25);
+          
+          // 「sports ball」または「ball」オブジェクトを認識
+          const ball = predictions.find(p => p.class === 'sports ball' || p.class === 'ball');
 
-        if (ball) {
-          const [bx, by, bw, bh] = ball.bbox;
-          const rawX = bx + bw / 2;
-          const rawY = by + bh / 2;
-          const rawR = Math.max(bw, bh) / 2;
+          if (ball) {
+            const [bx, by, bw, bh] = ball.bbox;
+            const rawX = bx + bw / 2;
+            const rawY = by + bh / 2;
+            const rawR = Math.max(bw, bh) / 2;
 
-          if (smoothX === null) {
-            smoothX = rawX; smoothY = rawY; smoothR = rawR;
+            if (smoothX === null) {
+              smoothX = rawX; smoothY = rawY; smoothR = rawR;
+            } else {
+              smoothX += (rawX - smoothX) * SMOOTHING;
+              smoothY += (rawY - smoothY) * SMOOTHING;
+              smoothR += (rawR - smoothR) * SMOOTHING;
+            }
+            ballInfoEl.innerText = `ボールAI検出中 (${Math.round(ball.score * 100)}%)`;
           } else {
-            smoothX += (rawX - smoothX) * SMOOTHING;
-            smoothY += (rawY - smoothY) * SMOOTHING;
-            smoothR += (rawR - smoothR) * SMOOTHING;
+            smoothX = null;
+            ballInfoEl.innerText = "バスケットボールを画面内に映してください";
           }
-          ballInfoEl.innerText = `ボールAI認識中 (${Math.round(ball.score * 100)}%)`;
-        } else {
-          smoothX = null;
-          ballInfoEl.innerText = "ボールを画面内に映してください";
+        } catch (e) {
+          console.error(e);
         }
       }
 
@@ -124,7 +133,7 @@
     function drawAR() {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-      // ガイドライン描画
+      // 投球ガイドライン
       ctx.beginPath();
       ctx.strokeStyle = '#00FF66';
       ctx.lineWidth = 4;
@@ -133,7 +142,7 @@
       ctx.quadraticCurveTo(canvas.width * 0.5, canvas.height * 0.2, canvas.width * 0.85, canvas.height * 0.45);
       ctx.stroke();
 
-      // AI認識枠描画
+      // AI認識枠
       if (smoothX !== null) {
         ctx.setLineDash([]);
         ctx.beginPath();
@@ -143,7 +152,7 @@
         ctx.stroke();
 
         ctx.beginPath();
-        ctx.arc(smoothX, smoothY, 6, 0, Math.PI * 2);
+        ctx.arc(smoothX, smoothY, 5, 0, Math.PI * 2);
         ctx.fillStyle = '#00FFFF';
         ctx.fill();
       }
