@@ -15,13 +15,14 @@
       bottom: 20px; 
       left: 50%; 
       transform: translateX(-50%); 
-      background: rgba(0,0,0,0.8); 
+      background: rgba(0,0,0,0.85); 
       padding: 12px 20px; 
       border-radius: 10px; 
       text-align: center;
-      min-width: 240px;
+      min-width: 260px;
+      z-index: 999;
     }
-    #status { font-size: 14px; font-weight: bold; color: #00ff66; }
+    #status { font-size: 14px; font-weight: bold; color: #00ff66; word-break: break-all; }
     #ball-info { font-size: 12px; color: #ccc; margin-top: 5px; }
   </style>
 </head>
@@ -31,8 +32,8 @@
     <video id="webcam" autoplay playsinline muted></video>
     <canvas id="canvas"></canvas>
     <div id="ui">
-      <div id="status">AIモデル読み込み中...</div>
-      <div id="ball-info">ボール未検出</div>
+      <div id="status">カメラ起動要求中...</div>
+      <div id="ball-info">準備中</div>
     </div>
   </div>
 
@@ -47,9 +48,28 @@
 
     let objectDetector;
     let lastVideoTime = -1;
-    let ballPosition = null; // 検出されたボールの座標 {x, y, radius}
+    let ballPosition = null;
 
-    // 1. MediaPipe Object Detector の初期化
+    // 1. カメラを優先して起動（画面真っ黒を防止）
+    async function initCamera() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "environment" },
+          audio: false
+        });
+        video.srcObject = stream;
+        // iOS Safari向けに明示的に再生
+        await video.play();
+        
+        statusEl.innerText = "カメラ起動完了。AI読み込み中...";
+        initMediaPipe();
+      } catch (err) {
+        statusEl.style.color = "#ff4d4d";
+        statusEl.innerText = "カメラエラー: " + err.message;
+      }
+    }
+
+    // 2. MediaPipe Object Detector の初期化
     async function initMediaPipe() {
       try {
         const vision = await FilesetResolver.forVisionTasks(
@@ -61,85 +81,71 @@
             modelAssetPath: `https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite`,
             delegate: "GPU"
           },
-          scoreThreshold: 0.35, // 検出閾値
+          scoreThreshold: 0.3,
           runningMode: "VIDEO"
         });
 
-        statusEl.innerText = "カメラ起動中...";
-        initCamera();
-      } catch (err) {
-        statusEl.innerText = "AI読み込みエラー: " + err.message;
-      }
-    }
-
-    // 2. カメラの初期化
-    async function initCamera() {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: "environment" },
-          audio: false
-        });
-        video.srcObject = stream;
-        statusEl.innerText = "リアルタイム追跡中";
+        statusEl.innerText = "AI追跡起動完了";
         requestAnimationFrame(renderLoop);
       } catch (err) {
-        statusEl.innerText = "カメラエラー: " + err.message;
+        statusEl.style.color = "#ffcc00";
+        statusEl.innerText = "AI読み込み失敗(カメラのみ表示中): " + err.message;
+        // AIの読み込みに失敗してもカメラ映像と簡易ガイドは表示し続ける
+        requestAnimationFrame(renderLoop);
       }
     }
 
-    // 3. メインレンダリング・推論ループ
+    // 3. メイン推論・描画ループ
     async function renderLoop() {
       canvas.width = video.videoWidth || window.innerWidth;
       canvas.height = video.videoHeight || window.innerHeight;
       ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-      // フレームが更新されたらAI推論を実行
+      // AI認識処理（モデルがロードされている場合のみ実行）
       if (objectDetector && video.currentTime !== lastVideoTime && video.readyState >= 2) {
         lastVideoTime = video.currentTime;
-        const startTimeMs = performance.now();
-        const detections = await objectDetector.detectForVideo(video, startTimeMs);
+        try {
+          const detections = await objectDetector.detectForVideo(video, performance.now());
+          const sportsBall = detections.detections.find(d => 
+            d.categories.some(c => c.categoryName === "sports ball")
+          );
 
-        // 「sports ball」カテゴリのオブジェクトを特定
-        const sportsBall = detections.detections.find(d => 
-          d.categories.some(c => c.categoryName === "sports ball")
-        );
+          if (sportsBall) {
+            const bb = sportsBall.boundingBox;
+            const scaleX = canvas.width / video.videoWidth;
+            const scaleY = canvas.height / video.videoHeight;
 
-        if (sportsBall) {
-          const bb = sportsBall.boundingBox;
-          // スケール変換（Video解像度 → Canvas描画サイズ）
-          const scaleX = canvas.width / video.videoWidth;
-          const scaleY = canvas.height / video.videoHeight;
-
-          ballPosition = {
-            x: (bb.originX + bb.width / 2) * scaleX,
-            y: (bb.originY + bb.height / 2) * scaleY,
-            radius: (Math.max(bb.width, bb.height) / 2) * scaleX
-          };
-          ballInfoEl.innerText = `ボール位置: X:${Math.round(ballPosition.x)} Y:${Math.round(ballPosition.y)}`;
-        } else {
-          ballPosition = null;
-          ballInfoEl.innerText = "ボール未検出";
+            ballPosition = {
+              x: (bb.originX + bb.width / 2) * scaleX,
+              y: (bb.originY + bb.height / 2) * scaleY,
+              radius: (Math.max(bb.width, bb.height) / 2) * scaleX
+            };
+            ballInfoEl.innerText = `ボール検出中 (X:${Math.round(ballPosition.x)}, Y:${Math.round(ballPosition.y)})`;
+          } else {
+            ballPosition = null;
+            ballInfoEl.innerText = "ボール未検出";
+          }
+        } catch (e) {
+          console.warn("推論時エラー:", e);
         }
       }
 
-      // 4. AR要素の描画
       drawAR();
-
       requestAnimationFrame(renderLoop);
     }
 
-    // 4. キャンバス描画処理
+    // 4. AR要素描画
     function drawAR() {
-      // (A) ガイド放物線（テスト描画）
+      // (A) 手本軌道ガイドライン（緑）
       ctx.beginPath();
-      ctx.strokeStyle = 'rgba(0, 255, 102, 0.6)';
+      ctx.strokeStyle = 'rgba(0, 255, 102, 0.7)';
       ctx.lineWidth = 4;
       ctx.setLineDash([8, 8]);
       ctx.moveTo(canvas.width * 0.15, canvas.height * 0.8);
       ctx.quadraticCurveTo(canvas.width * 0.5, canvas.height * 0.2, canvas.width * 0.85, canvas.height * 0.45);
       ctx.stroke();
 
-      // (B) 検出されたボールのリアルタイム追跡枠（オレンジ色の円）
+      // (B) 検出されたボール枠（オレンジ）
       if (ballPosition) {
         ctx.setLineDash([]);
         ctx.beginPath();
@@ -147,17 +153,11 @@
         ctx.strokeStyle = '#FF6600';
         ctx.lineWidth = 4;
         ctx.stroke();
-
-        // 中心点
-        ctx.beginPath();
-        ctx.arc(ballPosition.x, ballPosition.y, 4, 0, Math.PI * 2);
-        ctx.fillStyle = '#FF6600';
-        ctx.fill();
       }
     }
 
-    // アプリ起動
-    initMediaPipe();
+    // カメラ起動からスタート
+    initCamera();
   </script>
 </body>
 </html>
