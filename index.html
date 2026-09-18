@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AR Free Throw Trainer - Stable Color Edition</title>
+  <title>AR Free Throw Trainer - Tap Lock Edition</title>
   <style>
     body { margin: 0; overflow: hidden; background: #000; color: #fff; font-family: sans-serif; }
     #container { position: relative; width: 100vw; height: 100vh; }
@@ -30,8 +30,8 @@
     <video id="webcam" autoplay playsinline muted></video>
     <canvas id="canvas"></canvas>
     <div id="ui">
-      <div id="status">カメラ起動中...</div>
-      <div id="ball-info">ボールを探しています</div>
+      <div id="status">カメラ起動完了</div>
+      <div id="ball-info">【操作】画面上のボールをタップしてロックオン！</div>
     </div>
   </div>
 
@@ -45,11 +45,13 @@
     const sampleCanvas = document.createElement('canvas');
     const sampleCtx = sampleCanvas.getContext('2d', { willReadFrequently: true });
 
-    // スムージング（手ブレ補正）用の変数
+    // ロックオン用の色ターゲット（RGB）
+    let targetRGB = null;
+
     let smoothX = null;
     let smoothY = null;
     let smoothR = null;
-    const SMOOTHING_FACTOR = 0.25; // 値が小さいほど動きが滑らか（追従は少し緩やか）
+    const SMOOTHING_FACTOR = 0.3;
 
     async function startCamera() {
       const constraintsList = [
@@ -69,17 +71,34 @@
       if (stream) {
         video.srcObject = stream;
         await video.play();
-        statusEl.style.color = "#00ff66";
-        statusEl.innerText = "カメラ起動完了！";
         requestAnimationFrame(processLoop);
-      } else {
-        statusEl.style.color = "#ff4d4d";
-        statusEl.innerText = "カメラアクセス失敗";
       }
     }
 
+    // タップ位置の色を取得してターゲットに設定
+    canvas.addEventListener('pointerdown', (e) => {
+      const rect = canvas.getBoundingClientRect();
+      const clickX = e.clientX - rect.left;
+      const clickY = e.clientY - rect.top;
+
+      const w = sampleCanvas.width || 120;
+      const h = sampleCanvas.height || 90;
+
+      const scaleX = w / canvas.width;
+      const scaleY = h / canvas.height;
+
+      const sampleX = Math.floor(clickX * scaleX);
+      const sampleY = Math.floor(clickY * scaleY);
+
+      const pixelData = sampleCtx.getImageData(sampleX, sampleY, 1, 1).data;
+      targetRGB = { r: pixelData[0], g: pixelData[1], b: pixelData[2] };
+
+      statusEl.innerText = "ボールの色をロックオンしました！";
+      statusEl.style.color = "#00ffff";
+    });
+
     function detectBallColor() {
-      const w = 120; // 処理速度向上のため軽量化
+      const w = 120;
       const h = Math.floor(video.videoHeight * (w / video.videoWidth)) || 90;
       sampleCanvas.width = w;
       sampleCanvas.height = h;
@@ -88,16 +107,24 @@
       const imgData = sampleCtx.getImageData(0, 0, w, h);
       const data = imgData.data;
 
+      if (!targetRGB) return; // タップされるまで処理保留
+
       let sumX = 0, sumY = 0, count = 0;
       let minX = w, maxX = 0, minY = h, maxY = 0;
+
+      const TOLERANCE = 45; // 色の許容誤差
 
       for (let i = 0; i < data.length; i += 4) {
         const r = data[i];
         const g = data[i + 1];
         const b = data[i + 2];
 
-        // バスケットボール特有のオレンジ色判定（厳格化）
-        if (r > 160 && g > 50 && g < 130 && b < 70 && (r - g) > 50) {
+        // ロックオンした色とのユークリッド距離計算
+        const diffR = Math.abs(r - targetRGB.r);
+        const diffG = Math.abs(g - targetRGB.g);
+        const diffB = Math.abs(b - targetRGB.b);
+
+        if (diffR < TOLERANCE && diffG < TOLERANCE && diffB < TOLERANCE) {
           const pixelIdx = i / 4;
           const x = pixelIdx % w;
           const y = Math.floor(pixelIdx / w);
@@ -113,12 +140,7 @@
         }
       }
 
-      // ある程度の大きさがあり、かつ縦横比が正方形に近い（丸い）場合のみ判定
-      const boxW = maxX - minX;
-      const boxH = maxY - minY;
-      const aspectRatio = boxW / (boxH || 1);
-
-      if (count > 25 && aspectRatio > 0.6 && aspectRatio < 1.4) {
+      if (count > 12) {
         const avgX = sumX / count;
         const avgY = sumY / count;
 
@@ -127,9 +149,8 @@
 
         const rawX = avgX * scaleX;
         const rawY = avgY * scaleY;
-        const rawR = Math.max((boxW * scaleX) / 2, 20);
+        const rawR = Math.max(((maxX - minX) * scaleX) / 2, 25);
 
-        // スムージング処理（位置のブレを抑制）
         if (smoothX === null) {
           smoothX = rawX;
           smoothY = rawY;
@@ -140,13 +161,9 @@
           smoothR += (rawR - smoothR) * SMOOTHING_FACTOR;
         }
 
-        ballInfoEl.innerText = `ボール検出中 (X:${Math.round(smoothX)}, Y:${Math.round(smoothY)})`;
+        ballInfoEl.innerText = `追跡中 (X:${Math.round(smoothX)}, Y:${Math.round(smoothY)})`;
       } else {
-        // 検出されなかった場合はゆっくりリセット
-        smoothX = null;
-        smoothY = null;
-        smoothR = null;
-        ballInfoEl.innerText = "オレンジ色のボールを探しています";
+        ballInfoEl.innerText = "ターゲット喪失：画面上のボールを再度タップしてください";
       }
     }
 
@@ -173,18 +190,18 @@
       ctx.quadraticCurveTo(canvas.width * 0.5, canvas.height * 0.2, canvas.width * 0.85, canvas.height * 0.45);
       ctx.stroke();
 
-      // ボール追跡枠（スムーズ化後）
-      if (smoothX !== null) {
+      // ボール追跡枠
+      if (smoothX !== null && targetRGB) {
         ctx.setLineDash([]);
         ctx.beginPath();
         ctx.arc(smoothX, smoothY, smoothR, 0, Math.PI * 2);
-        ctx.strokeStyle = '#FF6600';
-        ctx.lineWidth = 5;
+        ctx.strokeStyle = '#00FFFF';
+        ctx.lineWidth = 4;
         ctx.stroke();
 
         ctx.beginPath();
         ctx.arc(smoothX, smoothY, 6, 0, Math.PI * 2);
-        ctx.fillStyle = '#FF6600';
+        ctx.fillStyle = '#00FFFF';
         ctx.fill();
       }
     }
