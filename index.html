@@ -3,9 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AR Free Throw Trainer - Stable</title>
-  <!-- 安定版のMediaPipe CDN -->
-  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.js" crossorigin="anonymous"></script>
+  <title>AR Free Throw Trainer - Stable Light Edition</title>
   <style>
     body { margin: 0; overflow: hidden; background: #000; color: #fff; font-family: sans-serif; }
     #container { position: relative; width: 100vw; height: 100vh; }
@@ -33,7 +31,7 @@
     <canvas id="canvas"></canvas>
     <div id="ui">
       <div id="status">カメラ起動中...</div>
-      <div id="ball-info">AI初期化準備中</div>
+      <div id="ball-info">オレンジ色のボールを探しています</div>
     </div>
   </div>
 
@@ -44,17 +42,19 @@
     const canvas = document.getElementById('canvas');
     const ctx = canvas.getContext('2d');
 
-    let objectDetector = null;
-    let lastVideoTime = -1;
+    // カラー分析用キャンバス
+    const sampleCanvas = document.createElement('canvas');
+    const sampleCtx = sampleCanvas.getContext('2d', { willReadFrequently: true });
+
     let ballPosition = null;
 
     window.onerror = function(msg, url, lineNo) {
       statusEl.style.color = "#ff4d4d";
-      statusEl.innerText = "エラー: " + msg + " (行:" + lineNo + ")";
+      statusEl.innerText = "エラー: " + msg;
       return false;
     };
 
-    // 1. カメラ起動処理
+    // 1. カメラ起動
     async function startCamera() {
       const constraintsList = [
         { video: { facingMode: "environment" }, audio: false },
@@ -74,98 +74,77 @@
         video.srcObject = stream;
         await video.play();
         statusEl.style.color = "#00ff66";
-        statusEl.innerText = "カメラ起動完了！AIロード待ち...";
-        requestAnimationFrame(drawLoop);
-        
-        loadMediaPipeWithRetry();
+        statusEl.innerText = "カメラ・リアルタイムAR起動完了！";
+        requestAnimationFrame(processLoop);
       } else {
         statusEl.style.color = "#ff4d4d";
         statusEl.innerText = "カメラアクセス失敗";
       }
     }
 
-    // 2. リトライ機能付きMediaPipe初期化
-    async function loadMediaPipeWithRetry(retries = 5) {
-      for (let i = 1; i <= retries; i++) {
-        try {
-          ballInfoEl.innerText = `AIデータ受信中... (${i}/${retries})`;
-          
-          if (!window.tasksVision) {
-            await new Promise(resolve => setTimeout(resolve, 1000));
-            if (!window.tasksVision) throw new Error("ライブラリ未読み込み");
-          }
+    // 2. 高速カラー検出処理（バスケットボールのオレンジ色を追跡）
+    function detectBallColor() {
+      const w = 160; // 処理軽量化のために低解像度化
+      const h = Math.floor(video.videoHeight * (w / video.videoWidth)) || 120;
+      sampleCanvas.width = w;
+      sampleCanvas.height = h;
 
-          const { ObjectDetector, FilesetResolver } = window.tasksVision;
-          const vision = await FilesetResolver.forVisionTasks(
-            "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
-          );
-          
-          objectDetector = await ObjectDetector.createFromOptions(vision, {
-            baseOptions: {
-              modelAssetPath: "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite",
-              delegate: "GPU"
-            },
-            scoreThreshold: 0.3,
-            runningMode: "VIDEO"
-          });
+      sampleCtx.drawImage(video, 0, 0, w, h);
+      const imgData = sampleCtx.getImageData(0, 0, w, h);
+      const data = imgData.data;
 
-          statusEl.innerText = "AR・AIリアルタイム追跡中";
-          ballInfoEl.innerText = "ボール未検出";
-          return; // 成功したら脱出
+      let sumX = 0, sumY = 0, count = 0;
 
-        } catch (err) {
-          console.warn(`試行 ${i} 失敗:`, err);
-          if (i === retries) {
-            ballInfoEl.style.color = "#ff4d4d";
-            ballInfoEl.innerText = "通信環境をお確かめの上、再読み込みしてください。";
-          } else {
-            await new Promise(resolve => setTimeout(resolve, 2000)); // 2秒待って再試行
-          }
+      for (let i = 0; i < data.length; i += 4) {
+        const r = data[i];
+        const g = data[i + 1];
+        const b = data[i + 2];
+
+        // オレンジ色・赤茶色の色域判定 (RGB)
+        if (r > 150 && g > 60 && g < 140 && b < 80 && (r - g) > 40) {
+          const pixelIdx = i / 4;
+          sumX += pixelIdx % w;
+          sumY += Math.floor(pixelIdx / w);
+          count++;
         }
+      }
+
+      if (count > 15) { // 規定ピクセル数以上あれば検出とみなす
+        const avgX = sumX / count;
+        const avgY = sumY / count;
+        
+        const scaleX = canvas.width / w;
+        const scaleY = canvas.height / h;
+
+        ballPosition = {
+          x: avgX * scaleX,
+          y: avgY * scaleY,
+          radius: Math.min(Math.sqrt(count) * 2.5, 60)
+        };
+        ballInfoEl.innerText = `ボール検出中 (X:${Math.round(ballPosition.x)}, Y:${Math.round(ballPosition.y)})`;
+      } else {
+        ballPosition = null;
+        ballInfoEl.innerText = "オレンジ色のボールを探しています";
       }
     }
 
-    // 3. メイン描画・推論ループ
-    async function drawLoop() {
+    // 3. ループ処理
+    function processLoop() {
       canvas.width = video.videoWidth || window.innerWidth;
       canvas.height = video.videoHeight || window.innerHeight;
       ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-      if (objectDetector && video.currentTime !== lastVideoTime && video.readyState >= 2) {
-        lastVideoTime = video.currentTime;
-        try {
-          const detections = await objectDetector.detectForVideo(video, performance.now());
-          const sportsBall = detections.detections.find(d => 
-            d.categories.some(c => c.categoryName === "sports ball")
-          );
-
-          if (sportsBall) {
-            const bb = sportsBall.boundingBox;
-            const scaleX = canvas.width / video.videoWidth;
-            const scaleY = canvas.height / video.videoHeight;
-
-            ballPosition = {
-              x: (bb.originX + bb.width / 2) * scaleX,
-              y: (bb.originY + bb.height / 2) * scaleY,
-              radius: (Math.max(bb.width, bb.height) / 2) * scaleX
-            };
-            ballInfoEl.innerText = `ボール検出！ (X:${Math.round(ballPosition.x)}, Y:${Math.round(ballPosition.y)})`;
-          } else {
-            ballPosition = null;
-            ballInfoEl.innerText = "ボール未検出";
-          }
-        } catch (e) {
-          console.warn("推論エラー:", e);
-        }
+      if (video.readyState >= 2) {
+        detectBallColor();
       }
 
       drawAR();
-      requestAnimationFrame(drawLoop);
+      requestAnimationFrame(processLoop);
     }
 
     // 4. AR描画
     function drawAR() {
-      // ガイドライン（緑）
+      // 投球ガイドライン（緑の破線）
       ctx.beginPath();
       ctx.strokeStyle = '#00FF66';
       ctx.lineWidth = 4;
@@ -174,17 +153,17 @@
       ctx.quadraticCurveTo(canvas.width * 0.5, canvas.height * 0.2, canvas.width * 0.85, canvas.height * 0.45);
       ctx.stroke();
 
-      // ボール追跡枠（オレンジ）
+      // ボール追跡枠（オレンジの円）
       if (ballPosition) {
         ctx.setLineDash([]);
         ctx.beginPath();
         ctx.arc(ballPosition.x, ballPosition.y, ballPosition.radius, 0, Math.PI * 2);
         ctx.strokeStyle = '#FF6600';
-        ctx.lineWidth = 4;
+        ctx.lineWidth = 5;
         ctx.stroke();
 
         ctx.beginPath();
-        ctx.arc(ballPosition.x, ballPosition.y, 4, 0, Math.PI * 2);
+        ctx.arc(ballPosition.x, ballPosition.y, 6, 0, Math.PI * 2);
         ctx.fillStyle = '#FF6600';
         ctx.fill();
       }
