@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AR Free Throw Trainer - Stable AI Edition</title>
+  <title>AR Free Throw Trainer - Dynamic Trajectory</title>
   <style>
     body { margin: 0; overflow: hidden; background: #000; color: #fff; font-family: sans-serif; }
     #container { position: relative; width: 100vw; height: 100vh; }
@@ -24,7 +24,6 @@
     #ball-info { font-size: 11px; color: #aaa; margin-top: 4px; }
   </style>
 
-  <!-- 順序・依存関係を完全に担保した単一構成バンドル -->
   <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.10.0/dist/tf.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
 </head>
@@ -48,15 +47,20 @@
 
     let model = null;
     let smoothX = null, smoothY = null, smoothR = null;
-    const SMOOTHING = 0.35;
+    const SMOOTHING = 0.4;
+
+    // ボールの位置・時刻履歴（速度計算用）
+    const posHistory = [];
+    const MAX_HISTORY = 5;
+
+    // 予測スピードベクトル
+    let velocityX = 0;
+    let velocityY = 0;
 
     async function initAI() {
       try {
         statusEl.innerText = "AIエンジン読み込み中...";
-        // tfjsの準備完了を確実に待機
         await tf.ready();
-        
-        // 軽量なCOCO-SSDモデルのロード
         model = await cocoSsd.load();
         statusEl.innerText = "AI準備完了！カメラを起動します";
         startCamera();
@@ -84,7 +88,7 @@
       if (stream) {
         video.srcObject = stream;
         await video.play();
-        statusEl.innerText = "リアルタイムAI追跡起動";
+        statusEl.innerText = "動的放物線トラッキング起動中";
         detectFrame();
       } else {
         statusEl.innerText = "カメラの起動に失敗しました";
@@ -99,8 +103,6 @@
       if (model && video.readyState >= 2) {
         try {
           const predictions = await model.detect(video, 5, 0.25);
-          
-          // 「sports ball」または「ball」オブジェクトを認識
           const ball = predictions.find(p => p.class === 'sports ball' || p.class === 'ball');
 
           if (ball) {
@@ -116,9 +118,20 @@
               smoothY += (rawY - smoothY) * SMOOTHING;
               smoothR += (rawR - smoothR) * SMOOTHING;
             }
-            ballInfoEl.innerText = `ボールAI検出中 (${Math.round(ball.score * 100)}%)`;
+
+            // 履歴追加と速度計算
+            const now = performance.now();
+            posHistory.push({ x: smoothX, y: smoothY, time: now });
+            if (posHistory.length > MAX_HISTORY) posHistory.shift();
+
+            calculateVelocity();
+
+            ballInfoEl.innerText = `ボール検出中 (Vx: ${Math.round(velocityX)}, Vy: ${Math.round(velocityY)})`;
           } else {
             smoothX = null;
+            posHistory.length = 0;
+            velocityX = 0;
+            velocityY = 0;
             ballInfoEl.innerText = "バスケットボールを画面内に映してください";
           }
         } catch (e) {
@@ -130,21 +143,24 @@
       requestAnimationFrame(detectFrame);
     }
 
+    // 移動履歴からフレーム間の平均速度（px/sec）を算出
+    function calculateVelocity() {
+      if (posHistory.length < 2) return;
+      const oldest = posHistory[0];
+      const newest = posHistory[posHistory.length - 1];
+      const dt = (newest.time - oldest.time) / 1000; // 秒換算
+
+      if (dt > 0) {
+        velocityX = (newest.x - oldest.x) / dt;
+        velocityY = (newest.y - oldest.y) / dt;
+      }
+    }
+
     function drawAR() {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-      // 投球ガイドライン
-      ctx.beginPath();
-      ctx.strokeStyle = '#00FF66';
-      ctx.lineWidth = 4;
-      ctx.setLineDash([8, 8]);
-      ctx.moveTo(canvas.width * 0.15, canvas.height * 0.8);
-      ctx.quadraticCurveTo(canvas.width * 0.5, canvas.height * 0.2, canvas.width * 0.85, canvas.height * 0.45);
-      ctx.stroke();
-
-      // AI認識枠
       if (smoothX !== null) {
-        ctx.setLineDash([]);
+        // 1. ボール認識位置の描画
         ctx.beginPath();
         ctx.arc(smoothX, smoothY, smoothR, 0, Math.PI * 2);
         ctx.strokeStyle = '#00FFFF';
@@ -155,7 +171,45 @@
         ctx.arc(smoothX, smoothY, 5, 0, Math.PI * 2);
         ctx.fillStyle = '#00FFFF';
         ctx.fill();
+
+        // 2. 物理演算による動的放物線の予測描画
+        drawDynamicTrajectory(smoothX, smoothY, velocityX, velocityY);
       }
+    }
+
+    // 速度と重力による未来の軌道（予測放物線）を描画
+    function drawDynamicTrajectory(startX, startY, vx, vy) {
+      ctx.beginPath();
+      ctx.strokeStyle = '#00FF66';
+      ctx.lineWidth = 4;
+      ctx.setLineDash([6, 6]);
+
+      let currX = startX;
+      let currY = startY;
+      
+      // 動かしていない場合（静止時）のデフォルト仰角フォールバック
+      let simVx = (Math.abs(vx) < 30) ? 250 : vx;
+      let simVy = (Math.abs(vy) < 30) ? -450 : vy;
+
+      const gravity = 980; // 画面座標系での重力加速度 (px/s^2)
+      const step = 0.03;   // シミュレーション刻み時間 (秒)
+      const totalSteps = 25;
+
+      ctx.moveTo(currX, currY);
+
+      for (let i = 0; i < totalSteps; i++) {
+        simVy += gravity * step; // 重力でY方向（下向き）へ加速
+        currX += simVx * step;
+        currY += simVy * step;
+
+        ctx.lineTo(currX, currY);
+
+        // 画面外に飛び出したら終了
+        if (currX < 0 || currX > canvas.width || currY > canvas.height) break;
+      }
+
+      ctx.stroke();
+      ctx.setLineDash([]);
     }
 
     initAI();
