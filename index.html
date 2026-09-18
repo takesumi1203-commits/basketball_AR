@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AR Free Throw Trainer - Precision Lock</title>
+  <title>AR Free Throw Trainer - AI Detection</title>
   <style>
     body { margin: 0; overflow: hidden; background: #000; color: #fff; font-family: sans-serif; }
     #container { position: relative; width: 100vw; height: 100vh; }
@@ -23,6 +23,10 @@
     #status { font-size: 13px; font-weight: bold; color: #00ff66; }
     #ball-info { font-size: 11px; color: #aaa; margin-top: 4px; }
   </style>
+  <!-- Google公式の安定したCDNからMediaPipe Objectron/Visionをロード -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core@4.10.0"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl@4.10.0"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3"></script>
 </head>
 <body>
 
@@ -30,8 +34,8 @@
     <video id="webcam" autoplay playsinline muted></video>
     <canvas id="canvas"></canvas>
     <div id="ui">
-      <div id="status">カメラ起動完了</div>
-      <div id="ball-info">【操作】ボールの中央をタップしてロック！</div>
+      <div id="status">AIモデルをロード中...</div>
+      <div id="ball-info">しばらくお待ちください</div>
     </div>
   </div>
 
@@ -42,170 +46,85 @@
     const canvas = document.getElementById('canvas');
     const ctx = canvas.getContext('2d');
 
-    const sampleCanvas = document.createElement('canvas');
-    const sampleCtx = sampleCanvas.getContext('2d', { willReadFrequently: true });
+    let model = null;
+    let ballPosition = null;
 
-    let targetRGB = null;
-    let tolerance = 25; // 許容誤差を大幅に厳密化
+    // 位置補正用（スムーズな追従）
+    let smoothX = null, smoothY = null, smoothR = null;
+    const SMOOTHING = 0.4;
 
-    let smoothX = null;
-    let smoothY = null;
-    let smoothR = null;
-    const SMOOTHING_FACTOR = 0.35;
+    async function initAI() {
+      try {
+        // 軽量なCOCO-SSDモデルをロード（スポーツボール認識対応）
+        model = await cocoSsd.load({ base: 'lite_mobilenet_v2' });
+        statusEl.innerText = "AIの準備完了！カメラを起動します";
+        startCamera();
+      } catch (err) {
+        statusEl.innerText = "AIロード失敗: " + err.message;
+        statusEl.style.color = "#ff4d4d";
+      }
+    }
 
     async function startCamera() {
-      const constraintsList = [
-        { video: { facingMode: "environment" }, audio: false },
-        { video: { facingMode: "user" }, audio: false },
-        { video: true, audio: false }
-      ];
-
-      let stream = null;
-      for (let constraints of constraintsList) {
-        try {
-          stream = await navigator.mediaDevices.getUserMedia(constraints);
-          if (stream) break;
-        } catch (e) {}
-      }
-
-      if (stream) {
+      const constraints = { video: { facingMode: "environment" }, audio: false };
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia(constraints);
         video.srcObject = stream;
         await video.play();
-        requestAnimationFrame(processLoop);
+        statusEl.innerText = "リアルタイムAI追跡中";
+        detectFrame();
+      } catch (e) {
+        // インカメラ fallback
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+          video.srcObject = stream;
+          await video.play();
+          statusEl.innerText = "リアルタイムAI追跡中";
+          detectFrame();
+        } catch(err) {
+          statusEl.innerText = "カメラ起動失敗";
+        }
       }
     }
 
-    // タップ位置とその周辺の平均色を厳密にサンプル取得
-    canvas.addEventListener('pointerdown', (e) => {
-      const rect = canvas.getBoundingClientRect();
-      const clickX = e.clientX - rect.left;
-      const clickY = e.clientY - rect.top;
-
-      const w = sampleCanvas.width || 160;
-      const h = sampleCanvas.height || 120;
-
-      const scaleX = w / canvas.width;
-      const scaleY = h / canvas.height;
-
-      const sampleX = Math.floor(clickX * scaleX);
-      const sampleY = Math.floor(clickY * scaleY);
-
-      // タップ周辺 5x5 ピクセルの平均色を取得
-      const size = 5;
-      const startX = Math.max(0, sampleX - 2);
-      const startY = Math.max(0, sampleY - 2);
-      const imgData = sampleCtx.getImageData(startX, startY, size, size).data;
-
-      let sumR = 0, sumG = 0, sumB = 0, count = 0;
-      for (let i = 0; i < imgData.length; i += 4) {
-        sumR += imgData[i];
-        sumG += imgData[i + 1];
-        sumB += imgData[i + 2];
-        count++;
-      }
-
-      targetRGB = {
-        r: Math.round(sumR / count),
-        g: Math.round(sumG / count),
-        b: Math.round(sumB / count)
-      };
-
-      // 色に応じて許容範囲をタイトに自動調整
-      tolerance = 22;
-
-      statusEl.innerText = `ロックオン完了 (R:${targetRGB.r} G:${targetRGB.g} B:${targetRGB.b})`;
-      statusEl.style.color = "#00ffff";
-      
-      smoothX = null; // リセット
-    });
-
-    function detectBallColor() {
-      const w = 160;
-      const h = Math.floor(video.videoHeight * (w / video.videoWidth)) || 120;
-      sampleCanvas.width = w;
-      sampleCanvas.height = h;
-
-      sampleCtx.drawImage(video, 0, 0, w, h);
-      const imgData = sampleCtx.getImageData(0, 0, w, h);
-      const data = imgData.data;
-
-      if (!targetRGB) return;
-
-      let sumX = 0, sumY = 0, count = 0;
-      let minX = w, maxX = 0, minY = h, maxY = 0;
-
-      for (let i = 0; i < data.length; i += 4) {
-        const r = data[i];
-        const g = data[i + 1];
-        const b = data[i + 2];
-
-        // マンハッタン距離による高速・厳密判定
-        const diff = Math.abs(r - targetRGB.r) + Math.abs(g - targetRGB.g) + Math.abs(b - targetRGB.b);
-
-        if (diff < tolerance * 2.2) {
-          const pixelIdx = i / 4;
-          const x = pixelIdx % w;
-          const y = Math.floor(pixelIdx / w);
-
-          sumX += x;
-          sumY += y;
-          count++;
-
-          if (x < minX) minX = x;
-          if (x > maxX) maxX = x;
-          if (y < minY) minY = y;
-          if (y > maxY) maxY = y;
-        }
-      }
-
-      // 検出領域が広すぎる（ノイズ巻き込み）場合はカット
-      const boxW = maxX - minX;
-      const boxH = maxY - minY;
-
-      if (count > 10 && boxW < w * 0.45 && boxH < h * 0.45) {
-        const avgX = sumX / count;
-        const avgY = sumY / count;
-
-        const scaleX = canvas.width / w;
-        const scaleY = canvas.height / h;
-
-        const rawX = avgX * scaleX;
-        const rawY = avgY * scaleY;
-        const rawR = Math.max(Math.max(boxW, boxH) * scaleX / 2, 18);
-
-        if (smoothX === null) {
-          smoothX = rawX;
-          smoothY = rawY;
-          smoothR = rawR;
-        } else {
-          smoothX += (rawX - smoothX) * SMOOTHING_FACTOR;
-          smoothY += (rawY - smoothY) * SMOOTHING_FACTOR;
-          smoothR += (rawR - smoothR) * SMOOTHING_FACTOR;
-        }
-
-        ballInfoEl.innerText = `ボール追跡中 (半径: ${Math.round(smoothR)}px)`;
-      } else if (count >= w * h * 0.3) {
-        ballInfoEl.innerText = "範囲が広すぎます：ボールの中央のみを再度タップしてください";
-      } else {
-        ballInfoEl.innerText = "追跡対象を探しています...";
-      }
-    }
-
-    function processLoop() {
+    async function detectFrame() {
       canvas.width = video.videoWidth || window.innerWidth;
       canvas.height = video.videoHeight || window.innerHeight;
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-      if (video.readyState >= 2) {
-        detectBallColor();
+      if (model && video.readyState === 4) {
+        const predictions = await model.detect(video, 5, 0.3);
+        
+        // 「sports ball」または「ball」として判定されたオブジェクトを探す
+        const ball = predictions.find(p => p.class === 'sports ball' || p.class === 'ball');
+
+        if (ball) {
+          const [bx, by, bw, bh] = ball.bbox;
+          const rawX = bx + bw / 2;
+          const rawY = by + bh / 2;
+          const rawR = Math.max(bw, bh) / 2;
+
+          if (smoothX === null) {
+            smoothX = rawX; smoothY = rawY; smoothR = rawR;
+          } else {
+            smoothX += (rawX - smoothX) * SMOOTHING;
+            smoothY += (rawY - smoothY) * SMOOTHING;
+            smoothR += (rawR - smoothR) * SMOOTHING;
+          }
+          ballInfoEl.innerText = `ボールAI認識中 (${Math.round(ball.score * 100)}%)`;
+        } else {
+          smoothX = null;
+          ballInfoEl.innerText = "ボールを画面内に映してください";
+        }
       }
 
       drawAR();
-      requestAnimationFrame(processLoop);
+      requestAnimationFrame(detectFrame);
     }
 
     function drawAR() {
-      // 投球ガイドライン
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // ガイドライン描画
       ctx.beginPath();
       ctx.strokeStyle = '#00FF66';
       ctx.lineWidth = 4;
@@ -214,23 +133,23 @@
       ctx.quadraticCurveTo(canvas.width * 0.5, canvas.height * 0.2, canvas.width * 0.85, canvas.height * 0.45);
       ctx.stroke();
 
-      // ボール追跡枠
-      if (smoothX !== null && targetRGB) {
+      // AI認識枠描画
+      if (smoothX !== null) {
         ctx.setLineDash([]);
         ctx.beginPath();
         ctx.arc(smoothX, smoothY, smoothR, 0, Math.PI * 2);
         ctx.strokeStyle = '#00FFFF';
-        ctx.lineWidth = 3;
+        ctx.lineWidth = 4;
         ctx.stroke();
 
         ctx.beginPath();
-        ctx.arc(smoothX, smoothY, 5, 0, Math.PI * 2);
+        ctx.arc(smoothX, smoothY, 6, 0, Math.PI * 2);
         ctx.fillStyle = '#00FFFF';
         ctx.fill();
       }
     }
 
-    startCamera();
+    initAI();
   </script>
 </body>
 </html>
