@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AR Free Throw Trainer - Dynamic Trajectory</title>
+  <title>AR Free Throw Trainer - Sensitive Trajectory</title>
   <style>
     body { margin: 0; overflow: hidden; background: #000; color: #fff; font-family: sans-serif; }
     #container { position: relative; width: 100vw; height: 100vh; }
@@ -47,13 +47,11 @@
 
     let model = null;
     let smoothX = null, smoothY = null, smoothR = null;
-    const SMOOTHING = 0.4;
+    const SMOOTHING = 0.5; // スムージングを少し弱めて応答性を向上
 
-    // ボールの位置・時刻履歴（速度計算用）
     const posHistory = [];
-    const MAX_HISTORY = 5;
+    const MAX_HISTORY = 4; // 直近4フレームで鋭く速度を感知
 
-    // 予測スピードベクトル
     let velocityX = 0;
     let velocityY = 0;
 
@@ -88,11 +86,8 @@
       if (stream) {
         video.srcObject = stream;
         await video.play();
-        statusEl.innerText = "動的放物線トラッキング起動中";
+        statusEl.innerText = "高感度トラッキング起動中";
         detectFrame();
-      } else {
-        statusEl.innerText = "カメラの起動に失敗しました";
-        statusEl.style.color = "#ff4d4d";
       }
     }
 
@@ -119,14 +114,13 @@
               smoothR += (rawR - smoothR) * SMOOTHING;
             }
 
-            // 履歴追加と速度計算
             const now = performance.now();
             posHistory.push({ x: smoothX, y: smoothY, time: now });
             if (posHistory.length > MAX_HISTORY) posHistory.shift();
 
             calculateVelocity();
 
-            ballInfoEl.innerText = `ボール検出中 (Vx: ${Math.round(velocityX)}, Vy: ${Math.round(velocityY)})`;
+            ballInfoEl.innerText = `検出中 (Vx: ${Math.round(velocityX)}, Vy: ${Math.round(velocityY)})`;
           } else {
             smoothX = null;
             posHistory.length = 0;
@@ -143,16 +137,16 @@
       requestAnimationFrame(detectFrame);
     }
 
-    // 移動履歴からフレーム間の平均速度（px/sec）を算出
     function calculateVelocity() {
       if (posHistory.length < 2) return;
       const oldest = posHistory[0];
       const newest = posHistory[posHistory.length - 1];
-      const dt = (newest.time - oldest.time) / 1000; // 秒換算
+      const dt = (newest.time - oldest.time) / 1000;
 
       if (dt > 0) {
-        velocityX = (newest.x - oldest.x) / dt;
-        velocityY = (newest.y - oldest.y) / dt;
+        // 動きの感度倍率（2.2倍）をかけて鋭く反応させる
+        velocityX = ((newest.x - oldest.x) / dt) * 2.2;
+        velocityY = ((newest.y - oldest.y) / dt) * 2.2;
       }
     }
 
@@ -160,51 +154,44 @@
       ctx.clearRect(0, 0, canvas.width, canvas.height);
 
       if (smoothX !== null) {
-        // 1. ボール認識位置の描画
+        // ボール枠
         ctx.beginPath();
         ctx.arc(smoothX, smoothY, smoothR, 0, Math.PI * 2);
         ctx.strokeStyle = '#00FFFF';
         ctx.lineWidth = 4;
         ctx.stroke();
 
-        ctx.beginPath();
-        ctx.arc(smoothX, smoothY, 5, 0, Math.PI * 2);
-        ctx.fillStyle = '#00FFFF';
-        ctx.fill();
-
-        // 2. 物理演算による動的放物線の予測描画
+        // 軌道描画
         drawDynamicTrajectory(smoothX, smoothY, velocityX, velocityY);
       }
     }
 
-    // 速度と重力による未来の軌道（予測放物線）を描画
     function drawDynamicTrajectory(startX, startY, vx, vy) {
       ctx.beginPath();
       ctx.strokeStyle = '#00FF66';
-      ctx.lineWidth = 4;
-      ctx.setLineDash([6, 6]);
+      ctx.lineWidth = 5; // 視認性を高めるため線を太く
+      ctx.setLineDash([8, 6]);
 
       let currX = startX;
       let currY = startY;
-      
-      // 動かしていない場合（静止時）のデフォルト仰角フォールバック
-      let simVx = (Math.abs(vx) < 30) ? 250 : vx;
-      let simVy = (Math.abs(vy) < 30) ? -450 : vy;
 
-      const gravity = 980; // 画面座標系での重力加速度 (px/s^2)
-      const step = 0.03;   // シミュレーション刻み時間 (秒)
-      const totalSteps = 25;
+      // 停止時のデフォルト仰角（ふんわり上向き）
+      let simVx = (Math.abs(vx) < 50) ? 300 : vx;
+      let simVy = (Math.abs(vy) < 50) ? -550 : vy;
+
+      const gravity = 1100; // 重力感度
+      const step = 0.03;
+      const totalSteps = 30;
 
       ctx.moveTo(currX, currY);
 
       for (let i = 0; i < totalSteps; i++) {
-        simVy += gravity * step; // 重力でY方向（下向き）へ加速
+        simVy += gravity * step;
         currX += simVx * step;
         currY += simVy * step;
 
         ctx.lineTo(currX, currY);
 
-        // 画面外に飛び出したら終了
         if (currX < 0 || currX > canvas.width || currY > canvas.height) break;
       }
 
