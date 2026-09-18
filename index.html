@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AR Free Throw Trainer - Stable Light Edition</title>
+  <title>AR Free Throw Trainer - Stable Color Edition</title>
   <style>
     body { margin: 0; overflow: hidden; background: #000; color: #fff; font-family: sans-serif; }
     #container { position: relative; width: 100vw; height: 100vh; }
@@ -20,7 +20,7 @@
       min-width: 280px;
       z-index: 999;
     }
-    #status { font-size: 13px; font-weight: bold; color: #00ff66; word-break: break-all; }
+    #status { font-size: 13px; font-weight: bold; color: #00ff66; }
     #ball-info { font-size: 11px; color: #aaa; margin-top: 4px; }
   </style>
 </head>
@@ -31,7 +31,7 @@
     <canvas id="canvas"></canvas>
     <div id="ui">
       <div id="status">カメラ起動中...</div>
-      <div id="ball-info">オレンジ色のボールを探しています</div>
+      <div id="ball-info">ボールを探しています</div>
     </div>
   </div>
 
@@ -42,19 +42,15 @@
     const canvas = document.getElementById('canvas');
     const ctx = canvas.getContext('2d');
 
-    // カラー分析用キャンバス
     const sampleCanvas = document.createElement('canvas');
     const sampleCtx = sampleCanvas.getContext('2d', { willReadFrequently: true });
 
-    let ballPosition = null;
+    // スムージング（手ブレ補正）用の変数
+    let smoothX = null;
+    let smoothY = null;
+    let smoothR = null;
+    const SMOOTHING_FACTOR = 0.25; // 値が小さいほど動きが滑らか（追従は少し緩やか）
 
-    window.onerror = function(msg, url, lineNo) {
-      statusEl.style.color = "#ff4d4d";
-      statusEl.innerText = "エラー: " + msg;
-      return false;
-    };
-
-    // 1. カメラ起動
     async function startCamera() {
       const constraintsList = [
         { video: { facingMode: "environment" }, audio: false },
@@ -74,7 +70,7 @@
         video.srcObject = stream;
         await video.play();
         statusEl.style.color = "#00ff66";
-        statusEl.innerText = "カメラ・リアルタイムAR起動完了！";
+        statusEl.innerText = "カメラ起動完了！";
         requestAnimationFrame(processLoop);
       } else {
         statusEl.style.color = "#ff4d4d";
@@ -82,10 +78,9 @@
       }
     }
 
-    // 2. 高速カラー検出処理（バスケットボールのオレンジ色を追跡）
     function detectBallColor() {
-      const w = 160; // 処理軽量化のために低解像度化
-      const h = Math.floor(video.videoHeight * (w / video.videoWidth)) || 120;
+      const w = 120; // 処理速度向上のため軽量化
+      const h = Math.floor(video.videoHeight * (w / video.videoWidth)) || 90;
       sampleCanvas.width = w;
       sampleCanvas.height = h;
 
@@ -94,41 +89,67 @@
       const data = imgData.data;
 
       let sumX = 0, sumY = 0, count = 0;
+      let minX = w, maxX = 0, minY = h, maxY = 0;
 
       for (let i = 0; i < data.length; i += 4) {
         const r = data[i];
         const g = data[i + 1];
         const b = data[i + 2];
 
-        // オレンジ色・赤茶色の色域判定 (RGB)
-        if (r > 150 && g > 60 && g < 140 && b < 80 && (r - g) > 40) {
+        // バスケットボール特有のオレンジ色判定（厳格化）
+        if (r > 160 && g > 50 && g < 130 && b < 70 && (r - g) > 50) {
           const pixelIdx = i / 4;
-          sumX += pixelIdx % w;
-          sumY += Math.floor(pixelIdx / w);
+          const x = pixelIdx % w;
+          const y = Math.floor(pixelIdx / w);
+
+          sumX += x;
+          sumY += y;
           count++;
+
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
         }
       }
 
-      if (count > 15) { // 規定ピクセル数以上あれば検出とみなす
+      // ある程度の大きさがあり、かつ縦横比が正方形に近い（丸い）場合のみ判定
+      const boxW = maxX - minX;
+      const boxH = maxY - minY;
+      const aspectRatio = boxW / (boxH || 1);
+
+      if (count > 25 && aspectRatio > 0.6 && aspectRatio < 1.4) {
         const avgX = sumX / count;
         const avgY = sumY / count;
-        
+
         const scaleX = canvas.width / w;
         const scaleY = canvas.height / h;
 
-        ballPosition = {
-          x: avgX * scaleX,
-          y: avgY * scaleY,
-          radius: Math.min(Math.sqrt(count) * 2.5, 60)
-        };
-        ballInfoEl.innerText = `ボール検出中 (X:${Math.round(ballPosition.x)}, Y:${Math.round(ballPosition.y)})`;
+        const rawX = avgX * scaleX;
+        const rawY = avgY * scaleY;
+        const rawR = Math.max((boxW * scaleX) / 2, 20);
+
+        // スムージング処理（位置のブレを抑制）
+        if (smoothX === null) {
+          smoothX = rawX;
+          smoothY = rawY;
+          smoothR = rawR;
+        } else {
+          smoothX += (rawX - smoothX) * SMOOTHING_FACTOR;
+          smoothY += (rawY - smoothY) * SMOOTHING_FACTOR;
+          smoothR += (rawR - smoothR) * SMOOTHING_FACTOR;
+        }
+
+        ballInfoEl.innerText = `ボール検出中 (X:${Math.round(smoothX)}, Y:${Math.round(smoothY)})`;
       } else {
-        ballPosition = null;
+        // 検出されなかった場合はゆっくりリセット
+        smoothX = null;
+        smoothY = null;
+        smoothR = null;
         ballInfoEl.innerText = "オレンジ色のボールを探しています";
       }
     }
 
-    // 3. ループ処理
     function processLoop() {
       canvas.width = video.videoWidth || window.innerWidth;
       canvas.height = video.videoHeight || window.innerHeight;
@@ -142,9 +163,8 @@
       requestAnimationFrame(processLoop);
     }
 
-    // 4. AR描画
     function drawAR() {
-      // 投球ガイドライン（緑の破線）
+      // 投球ガイドライン
       ctx.beginPath();
       ctx.strokeStyle = '#00FF66';
       ctx.lineWidth = 4;
@@ -153,17 +173,17 @@
       ctx.quadraticCurveTo(canvas.width * 0.5, canvas.height * 0.2, canvas.width * 0.85, canvas.height * 0.45);
       ctx.stroke();
 
-      // ボール追跡枠（オレンジの円）
-      if (ballPosition) {
+      // ボール追跡枠（スムーズ化後）
+      if (smoothX !== null) {
         ctx.setLineDash([]);
         ctx.beginPath();
-        ctx.arc(ballPosition.x, ballPosition.y, ballPosition.radius, 0, Math.PI * 2);
+        ctx.arc(smoothX, smoothY, smoothR, 0, Math.PI * 2);
         ctx.strokeStyle = '#FF6600';
         ctx.lineWidth = 5;
         ctx.stroke();
 
         ctx.beginPath();
-        ctx.arc(ballPosition.x, ballPosition.y, 6, 0, Math.PI * 2);
+        ctx.arc(smoothX, smoothY, 6, 0, Math.PI * 2);
         ctx.fillStyle = '#FF6600';
         ctx.fill();
       }
