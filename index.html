@@ -3,9 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AR Free Throw Trainer - MediaPipe Tracking</title>
-  <!-- MediaPipe Tasks Vision CDN -->
-  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/vision_bundle.js" crossorigin="anonymous"></script>
+  <title>AR Free Throw Trainer - Debug</title>
   <style>
     body { margin: 0; overflow: hidden; background: #000; color: #fff; font-family: sans-serif; }
     #container { position: relative; width: 100vw; height: 100vh; }
@@ -19,11 +17,10 @@
       padding: 12px 20px; 
       border-radius: 10px; 
       text-align: center;
-      min-width: 260px;
+      min-width: 280px;
       z-index: 999;
     }
-    #status { font-size: 14px; font-weight: bold; color: #00ff66; word-break: break-all; }
-    #ball-info { font-size: 12px; color: #ccc; margin-top: 5px; }
+    #status { font-size: 13px; font-weight: bold; color: #00ff66; word-break: break-all; }
   </style>
 </head>
 <body>
@@ -32,132 +29,97 @@
     <video id="webcam" autoplay playsinline muted></video>
     <canvas id="canvas"></canvas>
     <div id="ui">
-      <div id="status">カメラ起動要求中...</div>
-      <div id="ball-info">準備中</div>
+      <div id="status">初期化スタート...</div>
     </div>
   </div>
 
   <script>
-    const { ObjectDetector, FilesetResolver } = tasksVision;
-    
+    const statusEl = document.getElementById('status');
     const video = document.getElementById('webcam');
     const canvas = document.getElementById('canvas');
     const ctx = canvas.getContext('2d');
-    const statusEl = document.getElementById('status');
-    const ballInfoEl = document.getElementById('ball-info');
 
-    let objectDetector;
-    let lastVideoTime = -1;
-    let ballPosition = null;
+    // 画面上にJavaScriptエラーを直接書き出す処理
+    window.onerror = function(msg, url, lineNo) {
+      statusEl.style.color = "#ff4d4d";
+      statusEl.innerText = "JSエラー: " + msg + " (行:" + lineNo + ")";
+      return false;
+    };
 
-    // 1. カメラを優先して起動（画面真っ黒を防止）
-    async function initCamera() {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: "environment" },
-          audio: false
-        });
-        video.srcObject = stream;
-        // iOS Safari向けに明示的に再生
-        await video.play();
-        
-        statusEl.innerText = "カメラ起動完了。AI読み込み中...";
-        initMediaPipe();
-      } catch (err) {
+    // 段階的にカメラ取得を試みる安全な関数
+    async function startCamera() {
+      statusEl.innerText = "Step 1: カメラアクセス要求中...";
+
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         statusEl.style.color = "#ff4d4d";
-        statusEl.innerText = "カメラエラー: " + err.message;
+        statusEl.innerText = "エラー: お使いのブラウザはカメラ機能に対応していません";
+        return;
       }
-    }
 
-    // 2. MediaPipe Object Detector の初期化
-    async function initMediaPipe() {
-      try {
-        const vision = await FilesetResolver.forVisionTasks(
-          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
-        );
+      // 取得条件の候補（条件が緩い順に試す）
+      const constraintsList = [
+        { video: { facingMode: "environment" }, audio: false },
+        { video: { facingMode: "user" }, audio: false },
+        { video: true, audio: false }
+      ];
+
+      let stream = null;
+      let lastErr = null;
+
+      for (let constraints of constraintsList) {
+        try {
+          stream = await navigator.mediaDevices.getUserMedia(constraints);
+          if (stream) break;
+        } catch (e) {
+          lastErr = e;
+        }
+      }
+
+      if (stream) {
+        statusEl.innerText = "Step 2: 映像ストリーム設定中...";
+        video.srcObject = stream;
         
-        objectDetector = await ObjectDetector.createFromOptions(vision, {
-          baseOptions: {
-            modelAssetPath: `https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite`,
-            delegate: "GPU"
-          },
-          scoreThreshold: 0.3,
-          runningMode: "VIDEO"
-        });
-
-        statusEl.innerText = "AI追跡起動完了";
-        requestAnimationFrame(renderLoop);
-      } catch (err) {
-        statusEl.style.color = "#ffcc00";
-        statusEl.innerText = "AI読み込み失敗(カメラのみ表示中): " + err.message;
-        // AIの読み込みに失敗してもカメラ映像と簡易ガイドは表示し続ける
-        requestAnimationFrame(renderLoop);
+        try {
+          await video.play();
+          statusEl.style.color = "#00ff66";
+          statusEl.innerText = "カメラ起動完了！画面描画中...";
+          requestAnimationFrame(drawLoop);
+        } catch (playErr) {
+          statusEl.style.color = "#ffcc00";
+          statusEl.innerText = "再生エラー: " + playErr.message + " (タップして再生)";
+          // 画面タップで強制再生するイベントリスナー
+          document.body.addEventListener('click', () => {
+            video.play();
+            statusEl.innerText = "カメラ起動完了！";
+            requestAnimationFrame(drawLoop);
+          }, { once: true });
+        }
+      } else {
+        statusEl.style.color = "#ff4d4d";
+        statusEl.innerText = "カメラ取得失敗: " + (lastErr ? lastErr.message : "不明なエラー");
       }
     }
 
-    // 3. メイン推論・描画ループ
-    async function renderLoop() {
+    // 簡易AR描画ループ
+    function drawLoop() {
       canvas.width = video.videoWidth || window.innerWidth;
       canvas.height = video.videoHeight || window.innerHeight;
       ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-      // AI認識処理（モデルがロードされている場合のみ実行）
-      if (objectDetector && video.currentTime !== lastVideoTime && video.readyState >= 2) {
-        lastVideoTime = video.currentTime;
-        try {
-          const detections = await objectDetector.detectForVideo(video, performance.now());
-          const sportsBall = detections.detections.find(d => 
-            d.categories.some(c => c.categoryName === "sports ball")
-          );
-
-          if (sportsBall) {
-            const bb = sportsBall.boundingBox;
-            const scaleX = canvas.width / video.videoWidth;
-            const scaleY = canvas.height / video.videoHeight;
-
-            ballPosition = {
-              x: (bb.originX + bb.width / 2) * scaleX,
-              y: (bb.originY + bb.height / 2) * scaleY,
-              radius: (Math.max(bb.width, bb.height) / 2) * scaleX
-            };
-            ballInfoEl.innerText = `ボール検出中 (X:${Math.round(ballPosition.x)}, Y:${Math.round(ballPosition.y)})`;
-          } else {
-            ballPosition = null;
-            ballInfoEl.innerText = "ボール未検出";
-          }
-        } catch (e) {
-          console.warn("推論時エラー:", e);
-        }
-      }
-
-      drawAR();
-      requestAnimationFrame(renderLoop);
-    }
-
-    // 4. AR要素描画
-    function drawAR() {
-      // (A) 手本軌道ガイドライン（緑）
+      // ガイド用点線
       ctx.beginPath();
-      ctx.strokeStyle = 'rgba(0, 255, 102, 0.7)';
+      ctx.strokeStyle = '#00FF66';
       ctx.lineWidth = 4;
       ctx.setLineDash([8, 8]);
       ctx.moveTo(canvas.width * 0.15, canvas.height * 0.8);
       ctx.quadraticCurveTo(canvas.width * 0.5, canvas.height * 0.2, canvas.width * 0.85, canvas.height * 0.45);
       ctx.stroke();
 
-      // (B) 検出されたボール枠（オレンジ）
-      if (ballPosition) {
-        ctx.setLineDash([]);
-        ctx.beginPath();
-        ctx.arc(ballPosition.x, ballPosition.y, ballPosition.radius, 0, Math.PI * 2);
-        ctx.strokeStyle = '#FF6600';
-        ctx.lineWidth = 4;
-        ctx.stroke();
-      }
+      requestAnimationFrame(drawLoop);
     }
 
-    // カメラ起動からスタート
-    initCamera();
+    // 起動
+    startCamera();
   </script>
 </body>
 </html>
